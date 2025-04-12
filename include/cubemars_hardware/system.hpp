@@ -2,11 +2,13 @@
 #ifndef CUBEMARS_HARDWARE__SYSTEM_HPP_
 #define CUBEMARS_HARDWARE__SYSTEM_HPP_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
-#include <cstdint>
 
+#include "cubemars_hardware/can.hpp"
+#include "cubemars_hardware/visibility_control.h"
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
 #include "hardware_interface/system_interface.hpp"
@@ -14,8 +16,6 @@
 #include "rclcpp/macros.hpp"
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
-#include "cubemars_hardware/visibility_control.h"
-#include "cubemars_hardware/can.hpp"
 
 namespace cubemars_hardware
 {
@@ -23,20 +23,19 @@ class CubeMarsSystemHardware : public hardware_interface::SystemInterface
 {
 public:
   RCLCPP_SHARED_PTR_DEFINITIONS(CubeMarsSystemHardware);
-  
+
   virtual ~CubeMarsSystemHardware();
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::CallbackReturn on_init(
-    const hardware_interface::HardwareInfo & info) override;
+  hardware_interface::CallbackReturn on_init(const hardware_interface::HardwareInfo &info) override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::CallbackReturn on_configure(
-    const rclcpp_lifecycle::State & previous_state) override;
+  hardware_interface::CallbackReturn
+  on_configure(const rclcpp_lifecycle::State &previous_state) override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::CallbackReturn on_cleanup(
-    const rclcpp_lifecycle::State & previous_state) override;
+  hardware_interface::CallbackReturn
+  on_cleanup(const rclcpp_lifecycle::State &previous_state) override;
 
   CUBEMARS_HARDWARE_PUBLIC
   std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
@@ -45,32 +44,39 @@ public:
   std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::return_type prepare_command_mode_switch(
-    const std::vector<std::string> & start_interfaces,
-    const std::vector<std::string> & stop_interfaces) override;
+  hardware_interface::return_type
+  prepare_command_mode_switch(const std::vector<std::string> &start_interfaces,
+                              const std::vector<std::string> &stop_interfaces) override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::return_type perform_command_mode_switch(
-    const std::vector<std::string> & start_interfaces,
-    const std::vector<std::string> & stop_interfaces) override;
+  hardware_interface::return_type
+  perform_command_mode_switch(const std::vector<std::string> &start_interfaces,
+                              const std::vector<std::string> &stop_interfaces) override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::CallbackReturn on_activate(
-    const rclcpp_lifecycle::State & previous_state) override;
+  hardware_interface::CallbackReturn
+  on_activate(const rclcpp_lifecycle::State &previous_state) override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::CallbackReturn on_deactivate(
-    const rclcpp_lifecycle::State & previous_state) override;
+  hardware_interface::CallbackReturn
+  on_deactivate(const rclcpp_lifecycle::State &previous_state) override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::return_type read(
-    const rclcpp::Time & time, const rclcpp::Duration & period) override;
+  hardware_interface::return_type read(const rclcpp::Time &time,
+                                       const rclcpp::Duration &period) override;
 
   CUBEMARS_HARDWARE_PUBLIC
-  hardware_interface::return_type write(
-    const rclcpp::Time & time, const rclcpp::Duration & period) override;
+  hardware_interface::return_type write(const rclcpp::Time &time,
+                                        const rclcpp::Duration &period) override;
 
 private:
+  /**
+   * @brief Filter command to be within limits to avoid out of range commands.
+   * @note Command in the direction towards the limit is allowed.
+   */
+  std::int32_t filter_command_direction(std::int32_t command, std::pair<double, double> pos_limit,
+                                        double current_pos);
+
   std::vector<double> hw_commands_positions_;
   std::vector<double> hw_commands_velocities_;
   std::vector<double> hw_commands_accelerations_;
@@ -85,6 +91,8 @@ private:
   std::vector<double> enc_offs_;
   std::vector<double> trq_limits_;
   std::vector<std::pair<std::int16_t, std::int16_t>> limits_;
+  std::vector<std::pair<double, double>> position_limits_; // [min, max] If set, ignore any
+                                                           // commands to actuate out of range
   std::vector<bool> read_only_;
 
   CanSocket can_;
@@ -108,6 +116,6 @@ private:
   std::vector<control_mode_t> control_mode_;
 };
 
-}  // namespace cubemars_hardware
+} // namespace cubemars_hardware
 
-#endif  // CUBEMARS_HARDWARE__SYSTEM_HPP_
+#endif // CUBEMARS_HARDWARE__SYSTEM_HPP_
