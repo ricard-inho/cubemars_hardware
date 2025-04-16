@@ -454,7 +454,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
           //   "current command for joint %lu: %d", i, current);
 
           // filter command to be within limits to avoid out of range commands
-          current = filter_command_direction(current, limits_[i], hw_states_positions_[i]);
+          current = filter_command_direction(current, position_limits_[i], hw_states_positions_[i]);
 
           std::uint8_t data[4];
           data[0] = current >> 24;
@@ -482,7 +482,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
           //   "speed command for joint %lu: %d", i, speed);
 
           // filter command to be within limits to avoid out of range commands
-          speed = filter_command_direction(speed, limits_[i], hw_states_positions_[i]);
+          speed = filter_command_direction(speed, position_limits_[i], hw_states_positions_[i]);
 
           std::uint8_t data[4];
           data[0] = speed >> 24;
@@ -510,7 +510,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
           //   "position command for joint %lu: %d", i, position);
 
           // filter command to be within limits to avoid out of range commands
-          position = filter_command_direction(position, limits_[i], hw_states_positions_[i]);
+          position =
+              filter_command_direction(position, position_limits_[i], hw_states_positions_[i]);
 
           std::uint8_t data[4];
           data[0] = position >> 24;
@@ -541,7 +542,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
           //   i, position, vel, acc);
 
           // filter command to be within limits to avoid out of range commands
-          position = filter_command_direction(position, limits_[i], hw_states_positions_[i]);
+          position =
+              filter_command_direction(position, position_limits_[i], hw_states_positions_[i]);
 
           std::uint8_t data[8];
           data[0] = position >> 24;
@@ -569,6 +571,11 @@ std::int32_t CubeMarsSystemHardware::filter_command_direction(std::int32_t comma
                                                               std::pair<double, double> pos_limit,
                                                               double current_pos)
 {
+  // skip if limit is not set
+  if (pos_limit.first == 0 && pos_limit.second == 0)
+  {
+    return command;
+  }
   // violate minimum limit
   if (current_pos < pos_limit.first && command < 0)
   {
