@@ -454,7 +454,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
           //   "current command for joint %lu: %d", i, current);
 
           // filter command to be within limits to avoid out of range commands
-          current = filter_command_direction(current, position_limits_[i], hw_states_positions_[i]);
+          current = filter_command_direction(current, position_limits_[i], hw_states_positions_[i],
+                                             enc_offs_[i], control_mode_[i]);
 
           std::uint8_t data[4];
           data[0] = current >> 24;
@@ -482,7 +483,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
           //   "speed command for joint %lu: %d", i, speed);
 
           // filter command to be within limits to avoid out of range commands
-          speed = filter_command_direction(speed, position_limits_[i], hw_states_positions_[i]);
+          speed = filter_command_direction(speed, position_limits_[i], hw_states_positions_[i],
+                                           enc_offs_[i], control_mode_[i]);
 
           std::uint8_t data[4];
           data[0] = speed >> 24;
@@ -511,7 +513,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
 
           // filter command to be within limits to avoid out of range commands
           position =
-              filter_command_direction(position, position_limits_[i], hw_states_positions_[i]);
+              filter_command_direction(position, position_limits_[i], hw_states_positions_[i],
+                                       enc_offs_[i], control_mode_[i]);
 
           std::uint8_t data[4];
           data[0] = position >> 24;
@@ -543,7 +546,8 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
 
           // filter command to be within limits to avoid out of range commands
           position =
-              filter_command_direction(position, position_limits_[i], hw_states_positions_[i]);
+              filter_command_direction(position, position_limits_[i], hw_states_positions_[i],
+                                       enc_offs_[i], control_mode_[i]);
 
           std::uint8_t data[8];
           data[0] = position >> 24;
@@ -569,29 +573,77 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
 
 std::int32_t CubeMarsSystemHardware::filter_command_direction(std::int32_t command,
                                                               std::pair<double, double> pos_limit,
-                                                              double current_pos)
+                                                              double current_pos, double enc_offset,
+                                                              const control_mode_t mode)
 {
   // skip if limit is not set
   if (pos_limit.first == 0 && pos_limit.second == 0)
   {
     return command;
   }
-  // violate minimum limit
-  if (current_pos < pos_limit.first && command < 0)
+
+  switch (mode)
   {
-    RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
-                "Ignoring command %d, joint %f is below min limit %f", command, current_pos,
-                pos_limit.first);
-    return 0;
-  }
-  // violate maximum limit
-  if (current_pos > pos_limit.second && command > 0)
+  case CURRENT_LOOP:
+  case SPEED_LOOP:
   {
-    RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
-                "Ignoring command %d, joint %f is above max limit %f", command, current_pos,
-                pos_limit.second);
-    return 0;
+    // Restrict command to be within limits to avoid out of range commands
+    // violate minimum limit
+    if (current_pos < pos_limit.first && command < 0)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Ignoring command %d, joint %f is below min limit %f", command, current_pos,
+                  pos_limit.first);
+      return 0;
+    }
+
+    // violate maximum limit
+    if (current_pos > pos_limit.second && command > 0)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Ignoring command %d, joint %f is above max limit %f", command, current_pos,
+                  pos_limit.second);
+      return 0;
+    }
+
+    break;
   }
+
+  case POSITION_LOOP:
+  case POSITION_SPEED_LOOP:
+  { // Restrict command to be within limits to avoid out of range commands
+    // Scale radian to int32_t
+    const double scale = 10000.0 * 180.0 / M_PI;
+    std::int32_t limit_min = static_cast<std::int32_t>((pos_limit.first + enc_offset) * scale);
+    std::int32_t limit_max = static_cast<std::int32_t>((pos_limit.second + enc_offset) * scale);
+    std::int32_t current_pos_int = static_cast<std::int32_t>((current_pos + enc_offset) * scale);
+
+    // violate minimum limit
+    if (current_pos_int < limit_min && command < limit_min)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Clipping position command %d: joint %.3f rad + offset %.3f below limit %.3f rad",
+                  command, current_pos, enc_offset, pos_limit.first);
+      return limit_min;
+    }
+    // violate maximum limit
+    if (current_pos_int > limit_max && command > limit_max)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Clipping position command %d: joint %.3f rad + offset %.3f above limit %.3f rad",
+                  command, current_pos, enc_offset, pos_limit.second);
+      return limit_max;
+    }
+
+    break;
+  }
+
+  default:
+    RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                 "Control mode %d not supported for command filtering", mode);
+    return command;
+  }
+
   // no limit violation or command is in the direction of the limit
   return command;
 }

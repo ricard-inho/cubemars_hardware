@@ -70,13 +70,6 @@ public:
                                         const rclcpp::Duration &period) override;
 
 private:
-  /**
-   * @brief Filter command to be within limits to avoid out of range commands.
-   * @note Command in the direction towards the limit is allowed.
-   */
-  std::int32_t filter_command_direction(std::int32_t command, std::pair<double, double> pos_limit,
-                                        double current_pos);
-
   std::vector<double> hw_commands_positions_;
   std::vector<double> hw_commands_velocities_;
   std::vector<double> hw_commands_accelerations_;
@@ -114,6 +107,14 @@ private:
 
   // active control mode for each actuator
   std::vector<control_mode_t> control_mode_;
+
+  /**
+   * @brief Filter command to be within limits to avoid out of range commands.
+   * @note Command in the direction towards the limit is allowed.
+   */
+  std::int32_t filter_command_direction(std::int32_t command, std::pair<double, double> pos_limit,
+                                        double current_pos, double enc_offset,
+                                        const control_mode_t control_mode);
 };
 
 } // namespace cubemars_hardware
