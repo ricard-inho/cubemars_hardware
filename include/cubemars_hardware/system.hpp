@@ -109,12 +109,25 @@ private:
   std::vector<control_mode_t> control_mode_;
 
   /**
-   * @brief Filter command to be within limits to avoid out of range commands.
-   * @note Command in the direction towards the limit is allowed.
+   * @brief Decide whether to accept the input command based on position limits and command
+   * direction.
+   * @param command The input command (target position or increment).
+   * @param pos_limit The [min, max] position limits.
+   * @param current_pos The current position of the actuator.
+   * @param enc_offset The encoder offset.
+   * @param control_mode The current control mode.
+   * @return true if the command is accepted, false otherwise.
    */
-  std::int32_t filter_command_direction(std::int32_t command, std::pair<double, double> pos_limit,
-                                        double current_pos, double enc_offset,
-                                        const control_mode_t control_mode);
+  bool accept_command_direction(std::int32_t command, std::pair<double, double> pos_limit,
+                                double current_pos, double enc_offset,
+                                const control_mode_t control_mode);
+
+  /**
+   * @brief Stop the specified motor by index.
+   * @param motor_index Index of the motor to stop.
+   * @return true if the motor was stopped successfully, false otherwise.
+   */
+  bool stop_motor(std::size_t motor_index);
 };
 
 } // namespace cubemars_hardware
