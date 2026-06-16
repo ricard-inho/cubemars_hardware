@@ -72,6 +72,8 @@ An example `ros2_control` URDF config with this hardware interface can be found 
 - `vel_limit`: OPTIONAL. Velocity limit in $\text{rad}/\text{s}$. (see explanation below)
 - `acc_limit`: OPTIONAL. Acceleration limit in $\text{rad}/\text{s}^2$. (see explanation below)
 - `read_only`: OPTIONAL. If set to 1, the current position is logged and no commands are sent to the motors.
+- `imp_kp`: OPTIONAL. Impedance stiffness in $\text{Nm}/\text{rad}$. If set, the `position` command interface is realized as a host-side impedance law over the current loop instead of the servo position loop. (see explanation below)
+- `imp_kd`: OPTIONAL. Impedance damping in $\text{Nm}\cdot\text{s}/\text{rad}$. Defaults to 0 if `imp_kp` is set but `imp_kd` is not.
 
 ### Encoder Offset
 
@@ -92,3 +94,17 @@ The `pos_limit_min` and `pos_limit_max` specify the hardware limits of joint pos
 The `position` command interface will by default use the Position Mode (servo mode 4) where the motor runs to the specified position at maximum speed and acceleration. If you want to use the Position-Speed Loop Mode (servo mode 6) you have to specify BOTH `vel_limit` and `acc_limit`. This will limit the maximum acceleration and velocity of the motor (trajectory planning). This does not work well together with a `joint_trajectory_controller`.
 
 Note that these limits have no effect if only one is set or if you don't use the `position` command interface.
+
+### Impedance Mode
+
+If `imp_kp` is set, claiming the `position` command interface no longer uses the servo position loop. Instead the interface is realized as a host-side impedance law that is sent to the motor over the current loop (servo mode 1) every `write()`:
+
+$$\tau = K_p (p_\text{cmd} - p) + K_d (v_\text{cmd} - v) + \tau_\text{ff}$$
+
+- $p_\text{cmd}$ is the `position` command, $p$ / $v$ are the measured position / velocity.
+- $v_\text{cmd}$ is `0` unless the `velocity` command interface is also claimed and commanded.
+- $\tau_\text{ff}$ is `0` unless the `effort` command interface is also claimed and commanded (torque feedforward).
+
+The resulting torque is converted to a current using `kt` and is subject to the same `pos_limit_min`/`pos_limit_max` direction filtering as the current loop.
+
+Note that the impedance loop runs at the controller manager update rate over CAN, so the achievable stiffness/bandwidth is lower than the motor's native MIT mode (which closes the same law on the motor MCU). It is well suited for low-to-moderate stiffness, compliant behavior. The `vel_limit`/`acc_limit` (`Position-Speed Loop`) settings have no effect in this mode.

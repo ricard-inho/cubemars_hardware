@@ -83,6 +83,9 @@ private:
   std::vector<double> torque_constants_;
   std::vector<double> enc_offs_;
   std::vector<double> trq_limits_;
+  std::vector<double> imp_kp_;          // impedance stiffness [Nm/rad]
+  std::vector<double> imp_kd_;          // impedance damping [Nm*s/rad]
+  std::vector<bool> impedance_;         // if true, position interface runs host-side impedance
   std::vector<std::pair<std::int16_t, std::int16_t>> limits_;
   std::vector<std::pair<double, double>> position_limits_; // [min, max] If set, ignore any
                                                            // commands to actuate out of range
@@ -98,6 +101,7 @@ private:
     SPEED_LOOP = 3,
     POSITION_LOOP = 4,
     POSITION_SPEED_LOOP = 6,
+    IMPEDANCE = 7, // host-side impedance, realized over the current loop
     UNDEFINED
   };
 

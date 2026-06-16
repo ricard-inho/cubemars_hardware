@@ -135,6 +135,33 @@ CubeMarsSystemHardware::on_init(const hardware_interface::HardwareInfo &info)
     {
       read_only_.emplace_back(false);
     }
+
+    // Impedance gains. If imp_kp is set, the position command interface is
+    // realized as a host-side impedance law over the current loop instead of
+    // the servo position loop:
+    //   tau = imp_kp * (pos_cmd - pos) + imp_kd * (vel_cmd - vel) + effort_cmd
+    if (joint.parameters.count("imp_kp") != 0)
+    {
+      double kp = std::stod(joint.parameters.at("imp_kp"));
+      double kd = joint.parameters.count("imp_kd") != 0
+                      ? std::stod(joint.parameters.at("imp_kd"))
+                      : 0.0;
+      if (kp < 0 || kd < 0)
+      {
+        RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                     "impedance gains must be non-negative: imp_kp=%f, imp_kd=%f", kp, kd);
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      imp_kp_.emplace_back(kp);
+      imp_kd_.emplace_back(kd);
+      impedance_.emplace_back(true);
+    }
+    else
+    {
+      imp_kp_.emplace_back(0);
+      imp_kd_.emplace_back(0);
+      impedance_.emplace_back(false);
+    }
   }
 
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -250,7 +277,11 @@ hardware_interface::return_type CubeMarsSystemHardware::prepare_command_mode_swi
     }
     else if (joint_interfaces == pos)
     {
-      if (limits_[i].first == 0 || limits_[i].second == 0)
+      if (impedance_[i])
+      {
+        start_modes_.push_back(IMPEDANCE);
+      }
+      else if (limits_[i].first == 0 || limits_[i].second == 0)
       {
         start_modes_.push_back(POSITION_LOOP);
       }
@@ -473,6 +504,47 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
         }
         break;
       }
+      case IMPEDANCE:
+      {
+        if (!std::isnan(hw_commands_positions_[i]))
+        {
+          // Host-side impedance law, realized over the current loop. The
+          // velocity reference is zero unless a velocity command is claimed,
+          // and the effort command (if claimed) acts as a torque feedforward.
+          double vel_cmd = std::isnan(hw_commands_velocities_[i]) ? 0.0 : hw_commands_velocities_[i];
+          double tau_ff = std::isnan(hw_commands_efforts_[i]) ? 0.0 : hw_commands_efforts_[i];
+          double tau = imp_kp_[i] * (hw_commands_positions_[i] - hw_states_positions_[i]) +
+                       imp_kd_[i] * (vel_cmd - hw_states_velocities_[i]) + tau_ff;
+
+          std::int32_t current = tau * 1000 / torque_constants_[i];
+          if (std::abs(current) >= 60000)
+          {
+            RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
+                         "impedance current command is over maximal allowed value of 60000: %d",
+                         current);
+            return hardware_interface::return_type::ERROR;
+          }
+
+          // filter command to be within limits to avoid out of range commands
+          if (accept_command_direction(current, position_limits_[i], hw_states_positions_[i],
+                                       enc_offs_[i], control_mode_[i]))
+          {
+            std::uint8_t data[4];
+            data[0] = current >> 24;
+            data[1] = current >> 16;
+            data[2] = current >> 8;
+            data[3] = current;
+
+            can_.write_message(can_ids_[i] | CURRENT_LOOP << 8, data, 4);
+          }
+          else
+          {
+            // Violate limits, stop motor
+            stop_motor(i);
+          }
+        }
+        break;
+      }
       case SPEED_LOOP:
       {
         if (!std::isnan(hw_commands_velocities_[i]))
@@ -608,6 +680,7 @@ bool CubeMarsSystemHardware::accept_command_direction(std::int32_t command,
   {
   case CURRENT_LOOP:
   case SPEED_LOOP:
+  case IMPEDANCE:
   {
     // Restrict command to be within limits to avoid out of range commands
     // violate minimum limit
