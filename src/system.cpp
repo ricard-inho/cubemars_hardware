@@ -1,5 +1,6 @@
 #include "cubemars_hardware/system.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -42,6 +43,7 @@ CubeMarsSystemHardware::on_init(const hardware_interface::HardwareInfo &info)
   hw_commands_velocities_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
   hw_commands_accelerations_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
   hw_commands_efforts_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
+  last_pos_commands_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
   control_mode_.resize(info_.joints.size(), control_mode_t::UNDEFINED);
 
   for (const hardware_interface::ComponentInfo &joint : info_.joints)
@@ -108,6 +110,17 @@ CubeMarsSystemHardware::on_init(const hardware_interface::HardwareInfo &info)
       position_limits_.emplace_back(std::make_pair(0, 0));
     }
 
+    // Optional hardware-side slew-rate cap on position commands [rad/s].
+    if (joint.parameters.count("max_velocity") != 0 &&
+        std::stod(joint.parameters.at("max_velocity")) > 0)
+    {
+      max_velocities_.emplace_back(std::stod(joint.parameters.at("max_velocity")));
+    }
+    else
+    {
+      max_velocities_.emplace_back(0);
+    }
+
     if (joint.parameters.count("enc_off") != 0)
     {
       enc_offs_.emplace_back(std::stod(joint.parameters.at("enc_off")));
@@ -170,21 +183,32 @@ CubeMarsSystemHardware::on_init(const hardware_interface::HardwareInfo &info)
 hardware_interface::CallbackReturn
 CubeMarsSystemHardware::on_configure(const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  const hardware_interface::CallbackReturn result =
-      can_.connect(can_itf_, can_ids_, 0xFFU) ? hardware_interface::CallbackReturn::SUCCESS
-                                              : hardware_interface::CallbackReturn::FAILURE;
+  const bool connected = can_.connect(can_itf_, can_ids_, 0xFFU);
+  comms_active_ = connected;
 
   RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Communication active");
 
-  return result;
+  return connected ? hardware_interface::CallbackReturn::SUCCESS
+                   : hardware_interface::CallbackReturn::FAILURE;
 }
 
 hardware_interface::CallbackReturn
 CubeMarsSystemHardware::on_cleanup(const rclcpp_lifecycle::State & /*previous_state*/)
 {
+  // Idempotent: the destructor also calls on_cleanup, and a hard shutdown may
+  // skip on_deactivate, so guard against operating on an already-closed socket.
+  if (!comms_active_)
+  {
+    return hardware_interface::CallbackReturn::SUCCESS;
+  }
+
+  // Make sure no motor is left executing its last command while we tear down.
+  stop_all_motors();
+
   const hardware_interface::CallbackReturn result =
       can_.disconnect() ? hardware_interface::CallbackReturn::SUCCESS
                         : hardware_interface::CallbackReturn::FAILURE;
+  comms_active_ = false;
 
   RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"), "Communication closed");
 
@@ -322,9 +346,24 @@ hardware_interface::return_type CubeMarsSystemHardware::perform_command_mode_swi
       hw_commands_efforts_[i] = std::numeric_limits<double>::quiet_NaN();
       hw_commands_velocities_[i] = std::numeric_limits<double>::quiet_NaN();
       hw_commands_positions_[i] = std::numeric_limits<double>::quiet_NaN();
+      // The motor would otherwise keep executing its previous command until a
+      // new controller claims it, so command an explicit stop on release.
+      if (!read_only_[i])
+      {
+        stop_motor(i);
+      }
     }
     // switch control mode
     control_mode_[i] = start_modes_[i];
+
+    // Seed the slew limiter from the current measured position so the first
+    // position command after a (re)claim ramps from where the joint actually
+    // is, instead of from a stale target.
+    if (start_modes_[i] == POSITION_LOOP || start_modes_[i] == POSITION_SPEED_LOOP ||
+        start_modes_[i] == IMPEDANCE)
+    {
+      last_pos_commands_[i] = hw_states_positions_[i];
+    }
   }
   return hardware_interface::return_type::OK;
 }
@@ -338,6 +377,9 @@ CubeMarsSystemHardware::on_activate(const rclcpp_lifecycle::State & /*previous_s
 hardware_interface::CallbackReturn
 CubeMarsSystemHardware::on_deactivate(const rclcpp_lifecycle::State & /*previous_state*/)
 {
+  // Stop every motor when the hardware is deactivated (e.g. controllers being
+  // shut down) so nothing keeps spinning on its last commanded speed/current.
+  stop_all_motors();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -346,7 +388,7 @@ hardware_interface::return_type CubeMarsSystemHardware::read(const rclcpp::Time 
 {
   bool all_ids[can_ids_.size()] = {false};
   std::uint32_t read_id;
-  std::uint8_t read_data[8];
+  std::uint8_t read_data[8] = {0};
   std::uint8_t read_len;
 
   std::int16_t pos_int;
@@ -354,6 +396,25 @@ hardware_interface::return_type CubeMarsSystemHardware::read(const rclcpp::Time 
   // read all buffered CAN messages
   while (can_.read_nonblocking(read_id, read_data, read_len))
   {
+    // Only trust frames coming from one of our motor CAN IDs. Bus noise or
+    // frames from other devices that happen to pass the mask must not be
+    // parsed as status, otherwise they corrupt the position/velocity state
+    // that the limit filter relies on.
+    auto it = std::find(can_ids_.begin(), can_ids_.end(), read_id);
+    if (it == can_ids_.end())
+    {
+      continue;
+    }
+
+    // A servo status frame is always 8 bytes. A shorter frame would leave us
+    // parsing stale/garbage bytes (fault, temperature, position), so drop it.
+    if (read_len < 8)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Ignoring malformed CAN frame (len %u) from CAN ID %u", read_len, read_id);
+      continue;
+    }
+
     if (read_data[7] != 0)
     {
       switch (read_data[7])
@@ -380,24 +441,20 @@ hardware_interface::return_type CubeMarsSystemHardware::read(const rclcpp::Time 
       case 7:
         RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"), "Motor stall.");
         break;
-        return hardware_interface::return_type::ERROR;
       }
     }
-    auto it = std::find(can_ids_.begin(), can_ids_.end(), read_id);
-    if (it != can_ids_.end())
+
+    int i = std::distance(can_ids_.begin(), it);
+    all_ids[i] = true;
+    pos_int = read_data[0] << 8 | read_data[1];
+    if (std::abs(pos_int) >= 32000)
     {
-      int i = std::distance(can_ids_.begin(), it);
-      all_ids[i] = true;
-      pos_int = read_data[0] << 8 | read_data[1];
-      if (std::abs(pos_int) >= 32000)
-      {
-        RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
-                    "Position has reached maximum possible value.");
-      }
-      hw_states_positions_[i] = pos_int;
-      hw_states_velocities_[i] = std::int16_t(read_data[2] << 8 | read_data[3]);
-      hw_states_efforts_[i] = std::int16_t(read_data[4] << 8 | read_data[5]);
+      RCLCPP_INFO(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Position has reached maximum possible value.");
     }
+    hw_states_positions_[i] = pos_int;
+    hw_states_velocities_[i] = std::int16_t(read_data[2] << 8 | read_data[3]);
+    hw_states_efforts_[i] = std::int16_t(read_data[4] << 8 | read_data[5]);
   }
 
   // check if all CAN IDs have received a message
@@ -454,8 +511,9 @@ hardware_interface::return_type CubeMarsSystemHardware::read(const rclcpp::Time 
 }
 
 hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time & /*time*/,
-                                                              const rclcpp::Duration & /*period*/)
+                                                              const rclcpp::Duration &period)
 {
+  const double dt = period.seconds();
   for (std::size_t i = 0; i < info_.joints.size(); i++)
   {
     if (!read_only_[i])
@@ -471,7 +529,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
       }
       case CURRENT_LOOP:
       {
-        if (!std::isnan(hw_commands_efforts_[i]))
+        if (std::isfinite(hw_commands_efforts_[i]))
         {
           std::int32_t current = hw_commands_efforts_[i] * 1000 / torque_constants_[i];
           if (std::abs(current) >= 60000)
@@ -506,14 +564,15 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
       }
       case IMPEDANCE:
       {
-        if (!std::isnan(hw_commands_positions_[i]))
+        if (std::isfinite(hw_commands_positions_[i]))
         {
           // Host-side impedance law, realized over the current loop. The
           // velocity reference is zero unless a velocity command is claimed,
           // and the effort command (if claimed) acts as a torque feedforward.
           double vel_cmd = std::isnan(hw_commands_velocities_[i]) ? 0.0 : hw_commands_velocities_[i];
           double tau_ff = std::isnan(hw_commands_efforts_[i]) ? 0.0 : hw_commands_efforts_[i];
-          double tau = imp_kp_[i] * (hw_commands_positions_[i] - hw_states_positions_[i]) +
+          double pos_cmd = sanitize_position_command(i, hw_commands_positions_[i], dt);
+          double tau = imp_kp_[i] * (pos_cmd - hw_states_positions_[i]) +
                        imp_kd_[i] * (vel_cmd - hw_states_velocities_[i]) + tau_ff;
 
           std::int32_t current = tau * 1000 / torque_constants_[i];
@@ -547,7 +606,7 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
       }
       case SPEED_LOOP:
       {
-        if (!std::isnan(hw_commands_velocities_[i]))
+        if (std::isfinite(hw_commands_velocities_[i]))
         {
           std::int32_t speed = hw_commands_velocities_[i] * erpm_conversions_[i];
           if (std::abs(speed) >= 100000)
@@ -582,13 +641,15 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
       }
       case POSITION_LOOP:
       {
-        if (!std::isnan(hw_commands_positions_[i]))
+        if (std::isfinite(hw_commands_positions_[i]))
         {
-          std::int32_t position = (hw_commands_positions_[i] + enc_offs_[i]) * 10000 * 180 / M_PI;
+          double pos_cmd = sanitize_position_command(i, hw_commands_positions_[i], dt);
+          std::int32_t position = (pos_cmd + enc_offs_[i]) * 10000 * 180 / M_PI;
           if (std::abs(position) >= 360000000)
           {
             RCLCPP_ERROR(rclcpp::get_logger("CubeMarsSystemHardware"),
-                         "speed command is over maximal allowed value of 360000000: %d", position);
+                         "position command is over maximal allowed value of 360000000: %d",
+                         position);
             return hardware_interface::return_type::ERROR;
           }
           // RCLCPP_INFO(
@@ -616,9 +677,10 @@ hardware_interface::return_type CubeMarsSystemHardware::write(const rclcpp::Time
         break;
       case POSITION_SPEED_LOOP:
       {
-        if (!std::isnan(hw_commands_positions_[i]))
+        if (std::isfinite(hw_commands_positions_[i]))
         {
-          std::int32_t position = (hw_commands_positions_[i] + enc_offs_[i]) * 10000 * 180 / M_PI;
+          double pos_cmd = sanitize_position_command(i, hw_commands_positions_[i], dt);
+          std::int32_t position = (pos_cmd + enc_offs_[i]) * 10000 * 180 / M_PI;
           std::int16_t vel = limits_[i].first;
           std::int16_t acc = limits_[i].second;
           if (std::abs(position) >= 360000000)
@@ -682,6 +744,17 @@ bool CubeMarsSystemHardware::accept_command_direction(std::int32_t command,
   case SPEED_LOOP:
   case IMPEDANCE:
   {
+    // These modes have no firmware position bound: the live position reading is
+    // the only thing keeping the joint inside its limits. If we have no valid
+    // reading (no CAN status yet, or a dropped/garbage frame) we cannot enforce
+    // the limit, so refuse to drive rather than command blindly.
+    if (std::isnan(current_pos))
+    {
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Refusing command %d: no valid position feedback to enforce limits", command);
+      return false;
+    }
+
     // Restrict command to be within limits to avoid out of range commands
     // violate minimum limit
     if (current_pos < pos_limit.first && command < 0)
@@ -760,6 +833,57 @@ bool CubeMarsSystemHardware::stop_motor(std::size_t joint_index)
   can_.write_message(can_ids_[joint_index] | SPEED_LOOP << 8, data, 4);
 
   return true;
+}
+
+double CubeMarsSystemHardware::sanitize_position_command(std::size_t joint_index, double command,
+                                                         double dt)
+{
+  const std::pair<double, double> &lim = position_limits_[joint_index];
+
+  // 1) Hard-clamp to the configured joint position limits. This is the last
+  //    line of defense: even a command that slipped past every upstream check
+  //    cannot be sent out of range.
+  if (lim.first != 0.0 || lim.second != 0.0)
+  {
+    const double clamped = std::clamp(command, lim.first, lim.second);
+    if (clamped != command)
+    {
+      RCLCPP_WARN(rclcpp::get_logger("CubeMarsSystemHardware"),
+                  "Clamped joint %lu position command %f to limit [%f, %f]", joint_index, command,
+                  lim.first, lim.second);
+      command = clamped;
+    }
+  }
+
+  // 2) Rate-limit the change relative to the previous command so a sudden jump
+  //    (garbage setpoint, controller glitch) cannot become a fast, large move.
+  if (max_velocities_[joint_index] > 0.0 && std::isfinite(last_pos_commands_[joint_index]) &&
+      dt > 0.0)
+  {
+    const double max_step = max_velocities_[joint_index] * dt;
+    const double delta =
+        std::clamp(command - last_pos_commands_[joint_index], -max_step, max_step);
+    command = last_pos_commands_[joint_index] + delta;
+  }
+
+  last_pos_commands_[joint_index] = command;
+  return command;
+}
+
+void CubeMarsSystemHardware::stop_all_motors()
+{
+  if (!comms_active_)
+  {
+    return;
+  }
+  for (std::size_t i = 0; i < can_ids_.size(); i++)
+  {
+    if (!read_only_[i])
+    {
+      stop_motor(i);
+      control_mode_[i] = UNDEFINED;
+    }
+  }
 }
 
 } // namespace cubemars_hardware

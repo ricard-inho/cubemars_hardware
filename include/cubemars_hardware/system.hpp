@@ -89,6 +89,9 @@ private:
   std::vector<std::pair<std::int16_t, std::int16_t>> limits_;
   std::vector<std::pair<double, double>> position_limits_; // [min, max] If set, ignore any
                                                            // commands to actuate out of range
+  std::vector<double> max_velocities_; // [rad/s] hardware-side slew-rate cap on position
+                                       // commands (0 = disabled)
+  std::vector<double> last_pos_commands_; // last sanitized position command, for slew limiting
   std::vector<bool> read_only_;
 
   CanSocket can_;
@@ -132,6 +135,32 @@ private:
    * @return true if the motor was stopped successfully, false otherwise.
    */
   bool stop_motor(std::size_t motor_index);
+
+  /**
+   * @brief Sanitize a position command before it is sent to a motor.
+   *
+   * Hard-clamps the command to the joint's configured position limits and
+   * rate-limits the change relative to the previous command (using the joint's
+   * max_velocity). This is the lowest-level safety net: it bounds both the
+   * target and the speed of approach regardless of what upstream produced.
+   * @param joint_index Index of the joint.
+   * @param command Desired position command [rad].
+   * @param dt Control period [s].
+   * @return The clamped, rate-limited position command [rad].
+   */
+  double sanitize_position_command(std::size_t joint_index, double command, double dt);
+
+  /**
+   * @brief Send a stop (zero-speed) command to every writable motor.
+   *
+   * Used on deactivate/cleanup so the servos do not keep executing their last
+   * CAN command (e.g. a non-zero speed/current) after the controllers stop.
+   */
+  void stop_all_motors();
+
+  // True while the CAN socket is open. Guards stop_all_motors()/disconnect so
+  // they are not run twice (on_cleanup is also called from the destructor).
+  bool comms_active_{false};
 };
 
 } // namespace cubemars_hardware
